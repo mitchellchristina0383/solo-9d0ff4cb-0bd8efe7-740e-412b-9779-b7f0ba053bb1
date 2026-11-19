@@ -21,13 +21,14 @@ from __future__ import annotations
 
 import argparse
 import io
+import itertools
 import json
 import sys
 import tarfile
 import urllib.error
 import urllib.request
 import uuid
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # minimal tar builder (no third-party dependencies)
@@ -206,6 +207,266 @@ def post_merge(base_url: str, lower: bytes, upper: bytes) -> Tuple[int, bytes, d
         return exc.code, exc.read(), {k.lower(): v for k, v in exc.headers.items()}
 
 
+def _get_json(url: str) -> Tuple[int, bytes, dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), {k.lower(): v for k, v in exc.headers.items()}
+
+
+def post_plan(base_url: str, payload: dict) -> Tuple[int, bytes, dict]:
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/plan",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), {k.lower(): v for k, v in exc.headers.items()}
+
+
+# --------------------------------------------------------------------------- #
+# rollout planning: an independent reference implementation
+#
+# The reference below shares no code with app/rollout.py.  It expands every
+# image into its snapshot-prefix set, measures usage as the sum of exclusive
+# bytes over the *union* of those sets (so a shared prefix counts once), and
+# tries every permutation to find the order with the lowest peak.
+# --------------------------------------------------------------------------- #
+def _prefixes(diff_ids: List[str]) -> List[Tuple[str, ...]]:
+    return [tuple(diff_ids[:index]) for index in range(1, len(diff_ids) + 1)]
+
+
+def ref_usage(
+    services: List[dict],
+    residents: List[dict],
+    usage: Dict[Tuple[str, ...], int],
+    switched: List[str],
+    extra: Optional[dict] = None,
+) -> int:
+    afloat: set = set()
+    for img in residents:
+        afloat.update(_prefixes(img["diff_ids"]))
+    for svc in services:
+        image = svc["new"] if svc["name"] in switched else svc["old"]
+        afloat.update(_prefixes(image["diff_ids"]))
+    if extra is not None:
+        afloat.update(_prefixes(extra["diff_ids"]))
+    return sum(usage[key] for key in afloat)
+
+
+def ref_best_order(
+    services: List[dict],
+    residents: List[dict],
+    usage: Dict[Tuple[str, ...], int],
+) -> Tuple[int, Tuple[str, ...]]:
+    best: Optional[Tuple[int, Tuple[str, ...]]] = None
+    for order in itertools.permutations(svc["name"] for svc in services):
+        by_name = {svc["name"]: svc for svc in services}
+        switched: List[str] = []
+        peak = ref_usage(services, residents, usage, switched)
+        for name in order:
+            peak = max(peak, ref_usage(services, residents, usage, switched, by_name[name]["new"]))
+            switched.append(name)
+        candidate = (peak, order)
+        if best is None or candidate < best:
+            best = candidate
+    assert best is not None
+    return best
+
+
+def _payload(services: List[dict], usage: Dict[Tuple[str, ...], int], budget: int,
+             residents: Optional[List[dict]] = None) -> dict:
+    return {
+        "services": [
+            {"name": svc["name"], "old": svc["old"], "new": svc["new"]}
+            for svc in services
+        ],
+        "resident_images": residents or [],
+        "snapshots": [
+            {"diff_ids_prefix": list(key), "exclusive_bytes": value}
+            for key, value in usage.items()
+        ],
+        "budget_bytes": budget,
+    }
+
+
+def _check_plan(name: str, payload: dict, base_url: str) -> int:
+    """POST one plan and cross-check it against the reference implementation."""
+    status, body, headers = post_plan(base_url, payload)
+    if status != 200:
+        print(f"[FAIL] plan {name}: HTTP {status}: {body[:200]!r}")
+        return 1
+    if "json" not in headers.get("content-type", ""):
+        print(f"[FAIL] plan {name}: wrong content type {headers.get('content-type')}")
+        return 1
+    result = json.loads(body)
+
+    services = payload["services"]
+    residents = payload["resident_images"]
+    usage = {tuple(item["diff_ids_prefix"]): item["exclusive_bytes"]
+             for item in payload["snapshots"]}
+    best_peak, best_order = ref_best_order(services, residents, usage)
+    failures = 0
+
+    feasible = best_peak <= payload["budget_bytes"]
+    if result["feasible"] != feasible:
+        print(f"[FAIL] plan {name}: feasible={result['feasible']} expected {feasible}")
+        return 1
+    if result["minimum_max_usage_bytes"] != best_peak:
+        print(f"[FAIL] plan {name}: optimum {result['minimum_max_usage_bytes']} != ref {best_peak}")
+        failures += 1
+
+    if feasible:
+        if result["max_usage_bytes"] != best_peak:
+            print(f"[FAIL] plan {name}: plan peak {result['max_usage_bytes']} != ref {best_peak}")
+            failures += 1
+        order = result["order"]
+        if sorted(order) != sorted(svc["name"] for svc in services):
+            print(f"[FAIL] plan {name}: order {order} is not a permutation")
+            return 1
+        switched: List[str] = []
+        by_name = {svc["name"]: svc for svc in services}
+        for rnd in result["rounds"]:
+            expected = ref_usage(services, residents, usage, switched, by_name[rnd["service"]]["new"])
+            if rnd["peak_bytes"] != expected:
+                print(f"[FAIL] plan {name}: round {rnd['round']} peak {rnd['peak_bytes']} != ref {expected}")
+                failures += 1
+            switched.append(rnd["service"])
+        if not failures:
+            print(f"[ OK ] plan {name}: feasible, peak {best_peak} within {payload['budget_bytes']}, "
+                  f"order {result['order']}")
+    else:
+        print(f"[ OK ] plan {name}: correctly infeasible (best peak {best_peak}, "
+              f"budget {payload['budget_bytes']}, shortfall {result['shortfall_bytes']})")
+    return failures
+
+
+def run_plan_checks(base_url: str) -> int:
+    failures = 0
+
+    # Scenario A: two services over a shared base snapshot.  A's warm-up adds
+    # 40, B's adds 20, so switching B first keeps the peak 20 bytes lower.
+    shared = {
+        ("c1",): 1000,
+        ("c1", "a_old"): 500,
+        ("c1", "a_new"): 40,
+        ("c1", "b_old"): 300,
+        ("c1", "b_new"): 20,
+    }
+    services_a = [
+        {"name": "alpha", "old": {"diff_ids": ["c1", "a_old"]},
+         "new": {"diff_ids": ["c1", "a_new"]}},
+        {"name": "beta", "old": {"diff_ids": ["c1", "b_old"]},
+         "new": {"diff_ids": ["c1", "b_new"]}},
+    ]
+    baseline_budget = 1820  # initial 1800; the best order peaks at 1820
+    failures += _check_plan("order/tight", _payload(services_a, shared, baseline_budget), base_url)
+    failures += _check_plan("order/roomy", _payload(services_a, shared, 2000), base_url)
+    failures += _check_plan("order/too-tight", _payload(services_a, shared, 1819), base_url)
+
+    # Scenario B: the two new images share an extra snapshot.  Sharing should
+    # lower the second round's warm-up cost; only the first warm-up pays for
+    # the shared snapshot.
+    sharing = {
+        ("c1",): 1000,
+        ("c1", "a_old"): 500,
+        ("c1", "b_old"): 300,
+        ("c1", "shared"): 60,
+    }
+    services_b = [
+        {"name": "alpha", "old": {"diff_ids": ["c1", "a_old"]},
+         "new": {"diff_ids": ["c1", "shared"]}},
+        {"name": "beta", "old": {"diff_ids": ["c1", "b_old"]},
+         "new": {"diff_ids": ["c1", "shared"]}},
+    ]
+    status, body, headers = post_plan(base_url, _payload(services_b, sharing, 1860))
+    if status == 200:
+        result = json.loads(body)
+        added = [rnd["warmup_added_bytes"] for rnd in result["rounds"]]
+        if result["feasible"] and sorted(added) == [0, 60]:
+            print("[ OK ] plan shared/one-snapshot: shared snapshot added once "
+                  f"(warm-up costs {added})")
+        else:
+            failures += 1
+            print(f"[FAIL] plan shared/one-snapshot: unexpected result {result}")
+    else:
+        failures += 1
+        print(f"[FAIL] plan shared/one-snapshot: HTTP {status}: {body[:200]!r}")
+    failures += _check_plan("shared/too-tight", _payload(services_b, sharing, 1859), base_url)
+
+    # Scenario C: three services where only one order fits.  The DP must find
+    # it rather than reporting infeasible.
+    services_c = [
+        {"name": "one", "old": {"diff_ids": ["base", "one_old"]},
+         "new": {"diff_ids": ["base", "one_new"]}},
+        {"name": "two", "old": {"diff_ids": ["base", "two_old"]},
+         "new": {"diff_ids": ["base", "two_new"]}},
+        {"name": "three", "old": {"diff_ids": ["base", "three_old"]},
+         "new": {"diff_ids": ["base", "three_new"]}},
+    ]
+    usage_c = {
+        ("base",): 1000,
+        ("base", "one_old"): 100,
+        ("base", "one_new"): 10,
+        ("base", "two_old"): 200,
+        ("base", "two_new"): 20,
+        ("base", "three_old"): 300,
+        ("base", "three_new"): 30,
+    }
+    # Initial 1600.  Best order switches the smallest old snapshot first and
+    # peaks at 1610; 1609 must be reported infeasible.
+    failures += _check_plan("three/order", _payload(services_c, usage_c, 1610), base_url)
+    failures += _check_plan("three/too-tight", _payload(services_c, usage_c, 1609), base_url)
+
+    # Scenario D: resident images are permanent residents during every round.
+    with_residents = dict(shared)
+    with_residents[("host",)] = 200
+    with_residents[("host", "daemon")] = 50
+    failures += _check_plan(
+        "resident",
+        _payload(services_a, with_residents, 2100,
+                 residents=[{"diff_ids": ["host", "daemon"]}]),
+        base_url,
+    )
+
+    # Scenario E: missing usage for a referenced snapshot must be an error.
+    payload = _payload(services_a, shared, 2000)
+    payload["snapshots"] = payload["snapshots"][:-1]
+    status, body, headers = post_plan(base_url, payload)
+    if status == 400 and json.loads(body)["detail"]["code"] == "missing_snapshot_usage":
+        print("[ OK ] plan missing-usage rejected with 400 missing_snapshot_usage")
+    else:
+        failures += 1
+        print(f"[FAIL] plan missing-usage: got HTTP {status}")
+
+    # Scenario F: conflicting duplicate sizes are rejected.
+    payload = _payload(services_a, shared, 2000)
+    payload["snapshots"].append({"diff_ids_prefix": ["c1"], "exclusive_bytes": 1})
+    status, body, headers = post_plan(base_url, payload)
+    if status == 400 and json.loads(body)["detail"]["code"] == "conflicting_snapshot_usage":
+        print("[ OK ] plan conflicting-usage rejected with 400 conflicting_snapshot_usage")
+    else:
+        failures += 1
+        print(f"[FAIL] plan conflicting-usage: got HTTP {status}")
+
+    # Scenario G: schema limit of 10 services is enforced by validation.
+    payload = _payload(services_a, shared, 2000)
+    payload["services"] = payload["services"] * 6
+    status, _, _ = post_plan(base_url, payload)
+    if status == 422:
+        print("[ OK ] plan with 12 services rejected with 422")
+    else:
+        failures += 1
+        print(f"[FAIL] plan with 12 services: got HTTP {status}")
+
+    return failures
+
+
 # --------------------------------------------------------------------------- #
 # scenarios
 # --------------------------------------------------------------------------- #
@@ -335,6 +596,18 @@ def main() -> int:
         else:
             failures += 1
             print(f"[FAIL] invalid input {name!r}: got HTTP {status}")
+
+    # The rollout planner is read-only and must not disturb the merge service.
+    print()
+    print("-- rollout planning (POST /plan) --")
+    failures += run_plan_checks(args.base_url)
+
+    health_status, health_body, _ = _get_json(args.base_url + "/health")
+    if health_status == 200 and json.loads(health_body) == {"status": "ok"}:
+        print("[ OK ] health still ok after planning calls")
+    else:
+        failures += 1
+        print(f"[FAIL] health after planning: HTTP {health_status}")
 
     print()
     if failures:

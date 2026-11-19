@@ -1,7 +1,7 @@
 services:
   layer-merger:
     build: .
-    image: oci-layer-merger:1.0.0
+    image: oci-layer-merger:1.1.0
     container_name: oci-layer-merger
     ports:
       - "8000:8000"
